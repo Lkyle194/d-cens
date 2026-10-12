@@ -35,7 +35,9 @@
     <input #fileInput type="file" accept="image/*" hidden (change)="onFiles($event.target?.files)" />
 
     <!-- Canvas (après image) : slider Avant/Après -->
-    <div class="stage" [class.hidden]="!hasImage()">
+    <div class="stage" #stage [class.hidden]="!hasImage()"
+      [style.width.px]="viewW() || null"
+      [style.height.px]="viewH() || null">
       <div class="viewport" #viewport>
         <!-- Couche "Après" (résultat) en fond -->
         <canvas #resultCanvas class="layer result"

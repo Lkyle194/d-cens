@@ -128,6 +128,65 @@ function newCanvas(w: number, h: number): OffscreenCanvas {
   return new OffscreenCanvas(Math.max(1, w | 0), Math.max(1, h | 0));
 }
 
+/**
+ * Correction colorimétrique post-SR.
+ * Real-ESRGAN (general) est un lisseur : sur une photo crite/soft il tire la
+ * luminance et efface une part du chroma (la mosaïque translucide est lissée
+ * vers le blanc/gris -> rendu "fantôme laiteux"). On compare source et
+ * résultat (zone commune, après redim.) et on compense :
+ *   - translation de luminance : recentre la luma du résultat sur celle de la
+ *     source (ajoute le même offset aux 3 canaux -> ne déplace pas les tons) ;
+ *   - gain de chroma : ré-injecte la saturation manquante autour de la luma
+ *     locale (profondit les tons sans les décaler).
+ * Adaptatif : source et résultat déjà alignés -> k≈1 et shift≈0 -> aucun effet.
+ */
+function colorCorrect(out: ImageData, src: ImageData): ImageData {
+  const sw = src.width, sh = src.height;
+  // Redimensionne le résultat aux dims source pour une comparaison zone à zone.
+  const oc = newCanvas(out.width, out.height);
+  oc.getContext('2d')!.putImageData(out, 0, 0);
+  const small = newCanvas(sw, sh);
+  const scx = small.getContext('2d')!;
+  scx.imageSmoothingEnabled = true;
+  scx.imageSmoothingQuality = 'high';
+  scx.drawImage(oc, 0, 0, out.width, out.height, 0, 0, sw, sh);
+  const sImg = scx.getImageData(0, 0, sw, sh);
+
+  const srcd = src.data, outd = sImg.data;
+  const n = sw * sh;
+  let mSr = 0, mSg = 0, mSb = 0, mOr = 0, mOg = 0, mOb = 0, satS = 0, satO = 0;
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    const sr = srcd[j], sg = srcd[j + 1], sb = srcd[j + 2];
+    const rr = outd[j], rg = outd[j + 1], rb = outd[j + 2];
+    mSr += sr; mSg += sg; mSb += sb;
+    mOr += rr; mOg += rg; mOb += rb;
+    satS += Math.max(sr, sg, sb) - Math.min(sr, sg, sb);
+    satO += Math.max(rr, rg, rb) - Math.min(rr, rg, rb);
+  }
+  // Moyennes (les compteurs ci-dessus sont des SOMMES sur n pixels).
+  const inv = 1 / n;
+  const shiftLuma =
+    0.299 * (mSr - mOr) * inv + 0.587 * (mSg - mOg) * inv + 0.114 * (mSb - mOb) * inv;
+  let k = satS / Math.max(1e-3, satO);
+  if (!Number.isFinite(k)) k = 1;
+  k = Math.min(2.5, Math.max(1, k));
+
+  const d = out.data;
+  for (let i = 0; i < out.width * out.height; i++) {
+    const j = i * 4;
+    const r = d[j], g = d[j + 1], b = d[j + 2];
+    const L = 0.299 * r + 0.587 * g + 0.114 * b;
+    const nr = L + (r - L) * k + shiftLuma;
+    const ng = L + (g - L) * k + shiftLuma;
+    const nb = L + (b - L) * k + shiftLuma;
+    d[j] = nr < 0 ? 0 : nr > 255 ? 255 : Math.round(nr);
+    d[j + 1] = ng < 0 ? 0 : ng > 255 ? 255 : Math.round(ng);
+    d[j + 2] = nb < 0 ? 0 : nb > 255 ? 255 : Math.round(nb);
+  }
+  return out;
+}
+
 let srcCanvasCache: { id: ImageData; canvas: OffscreenCanvas } | null = null;
 function srcCanvasOf(src: ImageData): OffscreenCanvas {
   if (!srcCanvasCache || srcCanvasCache.id !== src) {
@@ -573,12 +632,15 @@ if (typeof self !== 'undefined') {
     let facesCount: number | undefined;
     if (msg.mode === 'sr') {
       result = await runSuperResolution(src, msg.targetW, msg.targetH, ep, !!msg.forceMosaic);
+      // Correction colorimétrique : le lisseur a désaturé/éclairé -> recentre.
+      result = colorCorrect(result, src);
     } else if (msg.mode === 'face') {
       const r = await runFaceRestore(src, ep);
       result = r.out;
       facesCount = r.faces;
     } else {
       result = await runDeMosaic(src, msg.targetW, msg.targetH, ep, !!msg.forceMosaic);
+      result = colorCorrect(result, src);
     }
     post({ type: 'result', data: result.data.buffer, w: result.width, h: result.height, provider: ep, faces: facesCount });
   } catch (err: any) {

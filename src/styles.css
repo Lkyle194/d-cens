@@ -165,6 +165,11 @@ app-root {
   justify-content: center;
 }
 
+/* Le viewport remplit exactement le .stage (lui-même redimensionné aux dims
+   calculés du fit « contain » — voir fitView() du composant). Plus de barres
+   « letterbox » : les canvas object-fit:contain remplissent tout l'espace,
+   donc le clip-path et la poignée (en % du viewport) coïncident avec l'image
+   visible et le curseur reste sur la coupure. */
 .viewport {
   position: relative;
   width: 100%;
@@ -176,6 +181,10 @@ app-root {
   overflow: hidden;
   background: #000;
   outline: 1px solid var(--color-line);
+}
+.stage.no-image {
+  width: 100%;
+  height: 100%;
 }
 
 .layer {

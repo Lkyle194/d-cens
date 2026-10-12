@@ -2,6 +2,7 @@ import {
   Component,
   ElementRef,
   NgZone,
+  AfterViewInit,
   OnDestroy,
   OnInit,
   ViewChild,
@@ -30,13 +31,15 @@ import { clearCache, isCached } from '../services/model-cache';
   templateUrl: './app.component.html',
   styles: ['/* styles globaux dans src/styles.css */'],
 })
-export class AppComponent implements OnInit, OnDestroy {
+export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   private zone = inject(NgZone);
   private inference = inject(InferenceService);
   private cdr = inject(ChangeDetectorRef);
 
   // ---- État UI (signals) ----
-  readonly modelId = signal<ModelId>('super-resolution');
+  // GFPGAN en défaut : c'est le seul des trois à produire un visage crédible
+  // sur les photos critees (Real-ESRGAN lisse/désature -> "fantôme laiteux").
+  readonly modelId = signal<ModelId>('face-restore');
   readonly busy = signal(false);
   readonly progress = signal(0);
   readonly progressLabel = signal('');
@@ -45,6 +48,18 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly hasImage = signal(false);
   readonly isDragging = signal(false);
   readonly slider = signal(0.5);
+  /**
+   * Dimensions calculées du .viewport (fit « contain » de l'image dans la scène).
+   * Le viewport est redimensionné à la BOÎTE réellement dessinée par les canvas
+   * (plus grand cadre conservant le ratio de l'image qui tient dans la scène).
+   * Avant, le viewport faisait 100 %×100 % de la scène et les canvas
+   * `object-fit:contain` y inséraient un letterbox : le clip-path (en % du
+   * canvas) et la poignée (en % du viewport) ne partagaient plus la même
+   * référence → curseur décalé de la coupure. Ici, viewport == image visible,
+   * donc clip et poignée s'alignent exactement.
+   */
+  viewW = signal(0);
+  viewH = signal(0);
   /** Force l'inversion de mosaïque (blocs carrés) même si le détecteur ne la voit pas. */
   readonly forceMosaic = signal(false);
   readonly cached = signal<Record<string, boolean>>({});
@@ -121,9 +136,21 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
+  private stageRo: ResizeObserver | null = null;
+
   async ngOnInit() {
     // Pré-calcule l'état "en cache" pour les badges.
     void this.refreshCached();
+  }
+
+  ngAfterViewInit() {
+    // Re-fit du viewport à chaque redimensionnement de la scène (rotation
+    // mobile, resize fenêtre) : le slider reste calé sur la coupure.
+    const stage = this.stageEl?.nativeElement;
+    if (stage && typeof ResizeObserver !== 'undefined') {
+      this.stageRo = new ResizeObserver(() => this.fitView());
+      this.stageRo.observe(stage);
+    }
   }
 
   async refreshCached() {
@@ -140,6 +167,29 @@ export class AppComponent implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     // InferenceService termine son worker (providedIn root, nettoyé par Angular).
+    this.stageRo?.disconnect();
+    this.stageRo = null;
+  }
+
+  /**
+   * Fit « contain » du viewport dans la scène : calcule le plus grand cadre
+   * conservant le ratio de l'image qui tient dans la scène, puis redimensionne
+   * le .viewport à ces dims. Les canvas `object-fit:contain` remplissent alors
+   * TOUT le viewport (aucun letterbox) -> le clip-path et la poignée, tous
+   * deux exprimés en % du viewport, coïncident exactement avec l'image visible.
+   */
+  fitView() {
+    const stage = this.stageEl?.nativeElement;
+    if (!stage || !this.hasImage()) return;
+    const sw = stage.clientWidth;
+    const sh = stage.clientHeight;
+    if (sw < 8 || sh < 8) return;
+    const iw = this.srcW || 1;
+    const ih = this.srcH || 1;
+    const k = Math.min(sw / iw, sh / ih);
+    this.viewW.set(Math.max(1, Math.round(iw * k)));
+    this.viewH.set(Math.max(1, Math.round(ih * k)));
+    this.cdr.markForCheck();
   }
 
   // ---- Chargement d'image ----
@@ -170,6 +220,7 @@ export class AppComponent implements OnInit, OnDestroy {
       this.resultCanvas.width = this.srcW;
       this.resultCanvas.height = this.srcH;
       this.resultCanvas.getContext('2d')!.drawImage(this.srcSnapshot, 0, 0);
+      this.fitView();
       this.slider.set(0.5);
       this.hasImage.set(true);
       this.cdr.markForCheck();
@@ -293,11 +344,13 @@ export class AppComponent implements OnInit, OnDestroy {
     }
     this.srcW = res.width;
     this.srcH = res.height;
+    this.fitView();
     this.cdr.markForCheck();
   }
 
   // ---- Slider Avant/Après ----
   @ViewChild('viewport') viewportEl?: ElementRef<HTMLElement>;
+  @ViewChild('stage') stageEl?: ElementRef<HTMLElement>;
   private draggingSlider = false;
   private get viewport(): HTMLElement | null {
     return this.viewportEl?.nativeElement ?? null;
