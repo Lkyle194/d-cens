@@ -27,6 +27,9 @@ const files = [
 ];
 
 fs.mkdirSync(dst, { recursive: true });
+// Index de dossier : évite au rewrite SPA de répondre index.html (text/html)
+// pour /ort/ ; les clients qui sondent le préfixe voient un 200 explicite.
+fs.writeFileSync(path.join(dst, 'index.html'), 'D-Cens runtime ORT OK\n');
 
 let copied = 0;
 for (const name of files) {
@@ -34,6 +37,11 @@ for (const name of files) {
   if (!fs.existsSync(from)) continue;
   fs.copyFileSync(from, path.join(dst, name));
   copied++;
+  // COPIE À LA RACINE : le bundle ort.all résout le wasm de l'EP WebGPU par
+  // rapport à import.meta.url (la racine du site, là où est le worker), PAS
+  // via env.wasm.wasmPath. Sans ces fichiers, le rewrite SPA renvoie
+  // index.html → WebAssembly.instantiate() "found 3c 21 64 6f" (<!do).
+  fs.copyFileSync(from, path.join(root, 'public', name));
 }
 
-console.log(`[postinstall-ort] ${copied} fichier(s) copié(s) dans public/ort/`);
+console.log(`[postinstall-ort] ${copied} fichier(s) copié(s) dans public/ort/ + racine public/`);
