@@ -1,0 +1,117 @@
+<div class="app" [class.no-image]="!hasImage()">
+  <!-- ===== En-tête ===== -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◇</span>
+      <div class="brand-text">
+        <h1>D‑Cens</h1>
+        <p>Dé‑censure &amp; restauration d'images — 100&nbsp;% locale</p>
+      </div>
+    </div>
+    <div class="status" *ngIf="provider()">
+      <span class="dot" [class.gpu]="provider() === 'webgpu'"></span>
+      {{ provider() }}
+    </div>
+  </header>
+
+  <!-- ===== Zone d'input / workspace ===== -->
+  <main class="workspace">
+    <!-- Drop zone (avant image) -->
+    <div
+      class="dropzone"
+      [class.dragging]="isDragging()"
+      [class.hidden]="hasImage()"
+      (click)="fileInput.click()"
+      (dragover)="isDragging.set(true)"
+      (dragleave)="isDragging.set(false)"
+      (drop)="isDragging.set(false); onFiles($event.dataTransfer?.files)"
+    >
+      <div class="dz-inner">
+        <div class="dz-icon" aria-hidden="true">🖼️</div>
+        <p class="dz-title">Déposez une image ici</p>
+        <p class="dz-sub">… ou touchez pour choisir · PNG / JPG / WebP</p>
+      </div>
+    </div>
+    <input #fileInput type="file" accept="image/*" hidden (change)="onFiles($event.target?.files)" />
+
+    <!-- Canvas (après image) : slider Avant/Après -->
+    <div class="stage" [class.hidden]="!hasImage()">
+      <div class="viewport" #viewport>
+        <!-- Couche "Après" (résultat) en fond -->
+        <canvas #resultCanvas class="layer result"
+          [style.clip-path]="'inset(0 ' + (100 - slider() * 100) + '% 0 0)'"></canvas>
+        <!-- Couche "Avant" (source) -->
+        <canvas #originalCanvas class="layer original"></canvas>
+
+        <!-- Poignée du slider -->
+        <div class="handle" [style.left]="sliderPct">
+          <div class="handle-line"></div>
+          <div class="handle-knob"
+            (pointerdown)="onKnobDown($event)"
+            (pointermove)="onKnobMove($event)"
+            (pointerup)="onKnobUp($event)"
+            (pointercancel)="onKnobUp($event)">⇔</div>
+        </div>
+
+        <!-- Labels -->
+        <span class="tag tag-left">Après</span>
+        <span class="tag tag-right">Avant</span>
+
+        <!-- Overlay progression -->
+        <div class="overlay" *ngIf="busy()">
+          <div class="overlay-card">
+            <div class="spinner" aria-hidden="true"></div>
+            <p class="overlay-label">{{ progressLabel() }}</p>
+            <div class="bar"><div class="bar-fill" [style.width]="progressPct"></div></div>
+            <p class="bar-pct">{{ progressPct }}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ===== Bandeau de contrôles ===== -->
+  <footer class="controls" *ngIf="hasImage()">
+    <div class="group selectors">
+      <label class="field-label" for="modelSelect">Modèle</label>
+      <select
+        id="modelSelect"
+        class="select"
+        [ngModel]="modelId()"
+        (ngModelChange)="modelId.set($any($event))"
+        [disabled]="busy()"
+      >
+        <option *ngFor="let id of models" [value]="id">
+          {{ modeLabel[id] }}
+          <span *ngIf="cached()[id]">· cache</span>
+        </option>
+      </select>
+    </div>
+
+    <div class="group actions">
+      <button class="btn primary" (click)="process()" [disabled]="busy()">
+        <span *ngIf="busy()">Traitement…</span>
+        <span *ngIf="!busy()">Traiter</span>
+      </button>
+      <button class="btn" (click)="savePng()" [disabled]="!hasImage() || busy()">Sauvegarder PNG</button>
+    </div>
+
+    <div class="group settings">
+      <button class="btn ghost" (click)="downloadApk()">↓ APK</button>
+      <button class="btn ghost" (click)="resetCache()" title="Vider le cache des modèles">Cache</button>
+    </div>
+  </footer>
+
+  <!-- ===== Message d'erreur ===== -->
+  <div class="toast" *ngIf="errorMsg()">
+    <span>⚠ {{ errorMsg() }}</span>
+    <button (click)="errorMsg.set(null)">×</button>
+  </div>
+
+  <!-- Puce d'aide modèle -->
+  <p class="hint" *ngIf="hasImage()">
+    {{ modeHint[modelId()] }} ·
+    <ng-container *ngIf="!webgpu">WebGPU non détecté — fallback WebGL</ng-container>
+    <ng-container *ngIf="webgpu">WebGPU prêt</ng-container>
+  </p>
+</div>

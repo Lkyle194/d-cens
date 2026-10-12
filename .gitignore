@@ -1,0 +1,61 @@
+# See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# Compiled output
+/dist
+/tmp
+/out-tsc
+/bazel-out
+
+# Node
+/node_modules
+npm-debug.log
+yarn-error.log
+
+# IDEs and editors
+.idea/
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/*
+
+# Capacitor / Android
+/android
+node_modules/.capacitor*
+
+# JDK 21 local (requis par AGP 8.13+ pour compiler capacitor-android)
+/tools
+
+# Modèles ONNX bruts (téléchargés à la volée depuis Hugging Face — voir src/models/registry.ts)
+*.onnx
+*.onnx.data
+
+# Runtime WebGPU (ORT) — recopié depuis node_modules par scripts/postinstall-ort.cjs
+*.wasm
+/public/ort
+
+# Vercel
+.vercel
+
+# Miscellaneous
+/.angular/cache
+.sass-cache/
+/connect.lock
+/coverage
+/libpeerconnection.log
+testem.log
+/typings
+__screenshots__/
+
+# System files
+.DS_Store
+Thumbs.db
