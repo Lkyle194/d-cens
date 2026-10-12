@@ -31,6 +31,8 @@ interface RunMsg {
   h: number;
   targetW: number;
   targetH: number;
+  /** Forcer l'anti-mosaïque même si le détecteur de grille ne la voit pas. */
+  forceMosaic?: boolean;
   /** Poids bruts déjà chargés/cachés par le thread principal. */
   modelBytes: { key: string; bytes: ArrayBuffer }[];
 }
@@ -148,14 +150,133 @@ function downscaleTo(img: ImageData, w: number, h: number): ImageData {
 }
 
 /**
- * SR — Real-ESRGAN general x4v3, forme statique 384 -> 1536.
- * Tiling (pas 256, marge 64 px), padding par clamp, fondage pondéré aux bords de tuile.
+ * Anti-mosaïque : l'image source est censurée par une grille de blocs (chaque
+ * bloc = couleur moyenne de la zone d'origine -> détails détruits). La SR ne
+ * peut pas les retrouver : elle hallucine. On inverse donc la mosaïque (moyenne
+ * par bloc -> bloc lisse) avant l'upscale, ce qui donne un rendu propre au lieu
+ * du "grain" de la double SR.
  */
-async function runSuperResolution(src: ImageData, outW: number, outH: number, ep: string): Promise<ImageData> {
+function luminance(rgba: Uint8ClampedArray, w: number, h: number): Float32Array {
+  const L = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const j = i * 4;
+    L[i] = 0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2];
+  }
+  return L;
+}
+
+/**
+ * Détecte la taille du bloc de mosaïque. Conditions :
+ *  1. une discontinuité de grille périodique (médiane des espacements) sur un
+ *     des deux axes — un seul axe suffit (grilles CARRÉES : même période X/Y) ;
+ *     deux axes détectés -> concordance ±15 % exigée.
+ *  2. VÉRIFICATION DE PHASE : les bords doivent s'aligner sur une même phase
+ *     modulo B (grille régulière). Une photo ordinaire (bords aléatoires :
+ *     rambarde, volets…) échoue ce test → pas d'anti-mosaïque, zéro dégradé.
+ */
+function mosaicBlockSize(L: Float32Array, w: number, h: number): number {
+  const TH = 8; // seuil de discontinuité de luminance (delta, pas ratio)
+  // Positions des bords le long de chaque axe, échantillonné.
+  const xs: number[] = []; // bords verticaux (x) vus sur des lignes
+  const ys: number[] = []; // bords horizontaux (y) vus sur des colonnes
+  const ystep = Math.max(1, (h / 12) | 0);
+  const xstep = Math.max(1, (w / 12) | 0);
+  for (let y = 0; y < h; y += ystep) {
+    for (let x = 1; x < w; x++) if (Math.abs(L[y * w + x] - L[y * w + x - 1]) > TH) xs.push(x);
+  }
+  for (let x = 0; x < w; x += xstep) {
+    for (let y = 1; y < h; y++) if (Math.abs(L[y * w + x] - L[(y - 1) * w + x]) > TH) ys.push(y);
+  }
+
+  const phasePeak = (positions: number[], B: number): number => {
+    const PHASES = 8;
+    const hist = new Array<number>(PHASES).fill(0);
+    for (const p of positions) hist[Math.min(PHASES - 1, ((p % B) / (B / PHASES)) | 0)]++;
+    return Math.max(...hist);
+  };
+  // Période candidate = médiane des espacements entre bords consécutifs.
+  const medianGap = (positions: number[]): number => {
+    const s = [...positions].sort((a, b) => a - b);
+    const gaps: number[] = [];
+    for (let i = 1; i < s.length; i++) {
+      const d = s[i] - s[i - 1];
+      if (d >= 8 && d <= 400) gaps.push(d);
+    }
+    if (!gaps.length) return 0;
+    gaps.sort((a, b) => a - b);
+    const B = gaps[(gaps.length / 2) | 0];
+    return B >= 8 && B <= 256 ? B : 0;
+  };
+
+  // Un axe peut suffire : les mosaïques sont des grilles CARRÉES — si les
+  // bords d'un axe sont trop doux (délétion de contraste directionnelle,
+  // downscale), l'autre porte la grille et on déduit la période.
+  const bx = xs.length >= 32 ? medianGap(xs) : 0;
+  const by = ys.length >= 32 ? medianGap(ys) : 0;
+  let B = 0;
+  if (bx && by) {
+    if (Math.abs(bx - by) > Math.max(bx, by) * 0.15) return 0;
+    B = Math.round((bx + by) / 2);
+  } else if (bx || by) {
+    B = bx || by;
+  }
+  if (!B) return 0;
+  const okX = xs.length >= 32 ? phasePeak(xs, B) >= xs.length * 0.55 : true;
+  const okY = ys.length >= 32 ? phasePeak(ys, B) >= ys.length * 0.55 : true;
+  return okX && okY ? B : 0;
+}
+
+/**
+ * Inverse la mosaïque : moyenne de chaque bloc -> bloc uniforme (puis la SR
+ * lisse les bords). Sans forceMosaic, ne s'applique que si la grille est
+ * DÉTECTÉE ; sinon src est retourné tel quel (zéro coût, zéro dégradation).
+ */
+function mosaicUndo(src: ImageData, forceMosaic = false): ImageData {
+  const w = src.width, h = src.height;
+  let B = mosaicBlockSize(luminance(src.data, w, h), w, h);
+  if (!B && forceMosaic) B = 12; // taille de bloc par défaut (mosaïque "molle")
+  if (!B) return src;
+  const out = new ImageData(w, h);
+  const od = out.data, sd = src.data;
+  for (let by = 0; by < h; by += B) {
+    const y1 = Math.min(h, by + B);
+    for (let bx = 0; bx < w; bx += B) {
+      const x1 = Math.min(w, bx + B);
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let y = by; y < y1; y++) for (let x = bx; x < x1; x++) {
+        const i = (y * w + x) * 4;
+        r += sd[i]; g += sd[i + 1]; b += sd[i + 2]; n++;
+      }
+      r /= n; g /= n; b /= n;
+      for (let y = by; y < y1; y++) for (let x = bx; x < x1; x++) {
+        const i = (y * w + x) * 4;
+        od[i] = Math.round(r); od[i + 1] = Math.round(g); od[i + 2] = Math.round(b); od[i + 3] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * SR — Real-ESRGAN general x4v3, forme statique 384 -> 1536.
+ * Anti-mosaïque (inversion de grille) en amont, tiling (pas 256, marge 64 px),
+ * padding par clamp, fondage pondéré aux bords de tuile.
+ */
+async function runSuperResolution(
+  src: ImageData,
+  outW: number,
+  outH: number,
+  ep: string,
+  forceMosaic = false,
+): Promise<ImageData> {
+  // Anti-mosaïque AUTOMATIQUE (si la grille est détectée) ou FORCÉE par le
+  // toggle UI ; sinon src est traité tel quel.
+  post({ type: 'progress', p: 0.02, label: 'demosaic' });
+  const clean = mosaicUndo(src, forceMosaic);
   const lib = await getOrt();
   const session = await getSession('realesr-general-x4v3-static384', ep);
-  const sw = src.width;
-  const sh = src.height;
+  const sw = clean.width;
+  const sh = clean.height;
   const sc = outW / sw;
   const TILE = 384;
   const STEP = 256;
@@ -178,9 +299,9 @@ async function runSuperResolution(src: ImageData, outW: number, outH: number, ep
         const sx = Math.max(0, Math.min(sw - 1, t.x + x));
         const si = (sy * sw + sx) * 4;
         const di = (y * TILE + x) * 4;
-        sImg.data[di] = src.data[si];
-        sImg.data[di + 1] = src.data[si + 1];
-        sImg.data[di + 2] = src.data[si + 2];
+        sImg.data[di] = clean.data[si];
+        sImg.data[di + 1] = clean.data[si + 1];
+        sImg.data[di + 2] = clean.data[si + 2];
         sImg.data[di + 3] = 255;
       }
     }
@@ -302,9 +423,22 @@ async function detectFaces(src: ImageData, ep: string): Promise<Face[]> {
  */
 async function runFaceRestore(src: ImageData, ep: string): Promise<{ out: ImageData; faces: number }> {
   const lib = await getOrt();
-  const faces = await detectFaces(src, ep);
-  const sc = srcCanvasOf(src);
-  const out = newCanvas(src.width, src.height);
+  // Base éventuellement pré-upscalée (GFPGAN attend un visage d'au moins ~256 px
+  // ; l'UI downscale la source à long edge 1200, un visage reste lisible mais
+  // petit : on le fait grossir avant détection + inference).
+  let base = src;
+  if (Math.max(src.width, src.height) < 512) {
+    const k = Math.min(2, 512 / Math.max(src.width, src.height));
+    const big = newCanvas(Math.max(8, Math.round(src.width * k)), Math.max(8, Math.round(src.height * k)));
+    const bc = big.getContext('2d')!;
+    bc.imageSmoothingEnabled = true;
+    bc.imageSmoothingQuality = 'high';
+    bc.drawImage(newCanvasFromImageData(src), 0, 0, src.width, src.height, 0, 0, big.width, big.height);
+    base = bc.getImageData(0, 0, big.width, big.height);
+  }
+  const faces = await detectFaces(base, ep);
+  const sc = srcCanvasOf(base);
+  const out = newCanvas(base.width, base.height);
   const octx = out.getContext('2d')!;
   octx.drawImage(sc, 0, 0);
 
@@ -315,10 +449,10 @@ async function runFaceRestore(src: ImageData, ep: string): Promise<{ out: ImageD
       ? faces
       : [
           {
-            x: Math.max(0, (src.width - Math.min(512, src.width)) / 2),
-            y: Math.max(0, (src.height - Math.min(512, src.height)) / 2),
-            w: Math.min(512, src.width),
-            h: Math.min(512, src.height),
+            x: Math.max(0, (base.width - Math.min(512, base.width)) / 2),
+            y: Math.max(0, (base.height - Math.min(512, base.height)) / 2),
+            w: Math.min(512, base.width),
+            h: Math.min(512, base.height),
             score: 0,
           },
         ];
@@ -333,10 +467,10 @@ async function runFaceRestore(src: ImageData, ep: string): Promise<{ out: ImageD
     const mh = f.h * 1.5;
     let mx = cx - mw / 2;
     let my = cy - mh / 2;
-    mx = Math.max(0, Math.min(mx, src.width - 1));
-    my = Math.max(0, Math.min(my, src.height - 1));
-    const rw = Math.max(8, Math.min(Math.round(mw), src.width - mx));
-    const rh = Math.max(8, Math.min(Math.round(mh), src.height - my));
+    mx = Math.max(0, Math.min(mx, base.width - 1));
+    my = Math.max(0, Math.min(my, base.height - 1));
+    const rw = Math.max(8, Math.min(Math.round(mw), base.width - mx));
+    const rh = Math.max(8, Math.min(Math.round(mh), base.height - my));
 
     // Redimensionne le crop en 512x512 (rétinoïde : preserve les proportions).
     const big = newCanvas(512, 512);
@@ -400,7 +534,7 @@ async function runFaceRestore(src: ImageData, ep: string): Promise<{ out: ImageD
     }
     octx.putImageData(region, Math.round(mx), Math.round(my));
   }
-  return { out: octx.getImageData(0, 0, src.width, src.height), faces: faces.length };
+  return { out: octx.getImageData(0, 0, base.width, base.height), faces: faces.length };
 }
 
 function newCanvasFromImageData(img: ImageData): OffscreenCanvas {
@@ -413,17 +547,20 @@ function newCanvasFromImageData(img: ImageData): OffscreenCanvas {
  * De-Mosaic — dé-pixelisation : SR ×4 sur l'original, puis 2e passe SR,
  * enfin redimensionnement aux dims demandées.
  */
-async function runDeMosaic(src: ImageData, outW: number, outH: number, ep: string): Promise<ImageData> {
+async function runDeMosaic(src: ImageData, outW: number, outH: number, ep: string, forceMosaic = false): Promise<ImageData> {
   post({ type: 'progress', p: 0.05, label: 'demosaic' });
-  let stage = await runSuperResolution(src, Math.round(src.width * 4), Math.round(src.height * 4), ep);
+  // 1re passe : anti-mosaïque (inversion de grille) + SR ×4.
+  let stage = await runSuperResolution(src, Math.round(src.width * 4), Math.round(src.height * 4), ep, forceMosaic);
   post({ type: 'progress', p: 0.5, label: 'demosaic' });
   const mid = downscaleTo(stage, Math.max(64, Math.round(stage.width / 2)), Math.max(64, Math.round(stage.height / 2)));
-  stage = await runSuperResolution(mid, Math.round(mid.width * 4), Math.round(mid.height * 4), ep);
+  // 2e passe : SR seule (plus de grille à inverser sur l'image lissée).
+  stage = await runSuperResolution(mid, Math.round(mid.width * 4), Math.round(mid.height * 4), ep, forceMosaic);
   post({ type: 'progress', p: 0.92, label: 'demosaic' });
   return downscaleTo(stage, outW, outH);
 }
 
-self.onmessage = async (e: MessageEvent<RunMsg>) => {
+if (typeof self !== 'undefined') {
+  self.onmessage = async (e: MessageEvent<RunMsg>) => {
   const msg = e.data;
   if (msg.type !== 'run') return;
   try {
@@ -435,16 +572,17 @@ self.onmessage = async (e: MessageEvent<RunMsg>) => {
     let result: ImageData;
     let facesCount: number | undefined;
     if (msg.mode === 'sr') {
-      result = await runSuperResolution(src, msg.targetW, msg.targetH, ep);
+      result = await runSuperResolution(src, msg.targetW, msg.targetH, ep, !!msg.forceMosaic);
     } else if (msg.mode === 'face') {
       const r = await runFaceRestore(src, ep);
       result = r.out;
       facesCount = r.faces;
     } else {
-      result = await runDeMosaic(src, msg.targetW, msg.targetH, ep);
+      result = await runDeMosaic(src, msg.targetW, msg.targetH, ep, !!msg.forceMosaic);
     }
     post({ type: 'result', data: result.data.buffer, w: result.width, h: result.height, provider: ep, faces: facesCount });
   } catch (err: any) {
     post({ type: 'error', message: String(err?.message ?? err) });
   }
-};
+  };
+}

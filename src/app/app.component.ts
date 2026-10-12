@@ -45,6 +45,8 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly hasImage = signal(false);
   readonly isDragging = signal(false);
   readonly slider = signal(0.5);
+  /** Force l'inversion de mosaïque (blocs carrés) même si le détecteur ne la voit pas. */
+  readonly forceMosaic = signal(false);
   readonly cached = signal<Record<string, boolean>>({});
   readonly webgpu = this.inference.webgpuAvailable;
   readonly models = MODEL_IDS;
@@ -246,7 +248,7 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     try {
-      const res = await this.inference.run(mode, src.data, src.w, src.h, targetW, targetH);
+      const res = await this.inference.run(mode, src.data, src.w, src.h, targetW, targetH, this.forceMosaic());
       await this.onResult(res, mode);
     } catch (e: any) {
       this.errorMsg.set(String(e?.message ?? e));
@@ -260,14 +262,30 @@ export class AppComponent implements OnInit, OnDestroy {
   private async onResult(res: InferenceResult, mode: RunMode) {
     const id = new ImageData(new Uint8ClampedArray(res.data), res.width, res.height);
     const rc = this.resultCanvas;
-    rc.width = res.width;
-    rc.height = res.height;
-    rc.getContext('2d')!.putImageData(id, 0, 0);
+    if (rc.width !== res.width || rc.height !== res.height) {
+      rc.width = res.width;
+      rc.height = res.height;
+    }
+    // OFFSCREENCANVAS -> drawImage : la re-découpe des layers (résultat
+    // upscalé, original redessiné aux dims du résultat) redessine
+    // systématiquement le canvas — putImageData seul peut rester caché
+    // derrière l'ancienne frame sur les GPU mobiles (bug preview constaté
+    // sur Android : avant/après identiques jusqu'au téléchargement).
+    const tmp = document.createElement('canvas');
+    tmp.width = res.width;
+    tmp.height = res.height;
+    tmp.getContext('2d')!.putImageData(id, 0, 0);
+    const rctx = rc.getContext('2d')!;
+    rctx.imageSmoothingEnabled = true;
+    rctx.imageSmoothingQuality = 'high';
+    rctx.drawImage(tmp, 0, 0);
     // Redessine la SOURCE aux dims du résultat (comparaison Avant/Après juste
     // : pour les modes upscale, l'original interpolé s'aligne pixel à pixel).
     if (this.srcSnapshot) {
-      this.originalCanvas.width = res.width;
-      this.originalCanvas.height = res.height;
+      if (this.originalCanvas.width !== res.width || this.originalCanvas.height !== res.height) {
+        this.originalCanvas.width = res.width;
+        this.originalCanvas.height = res.height;
+      }
       const octx = this.originalCanvas.getContext('2d')!;
       octx.imageSmoothingEnabled = true;
       octx.imageSmoothingQuality = mode === 'face' ? 'high' : 'medium';

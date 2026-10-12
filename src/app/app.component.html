@@ -39,9 +39,11 @@
       <div class="viewport" #viewport>
         <!-- Couche "Après" (résultat) en fond -->
         <canvas #resultCanvas class="layer result"
-          [style.clip-path]="'inset(0 ' + (100 - slider() * 100) + '% 0 0)'"></canvas>
-        <!-- Couche "Avant" (source) -->
-        <canvas #originalCanvas class="layer original"></canvas>
+          [style.clip-path]="'inset(0 ' + (100 - slider() * 100) + '% 0 0)'"
+        ></canvas>
+        <canvas #originalCanvas class="layer original"
+          [style.clip-path]="'inset(0 0 0 ' + (slider() * 100) + '%)'"
+        ></canvas>
 
         <!-- Poignée du slider -->
         <div class="handle" [style.left]="sliderPct">
@@ -97,6 +99,10 @@
     </div>
 
     <div class="group settings">
+      <label class="toggle" [class.hidden]="modelId() === 'face-restore'" title="Inverse la grille de blocs avant l'upscale — à cocher si l'image est censurée par une mosaïque carrée">
+        <input type="checkbox" [checked]="forceMosaic()" (change)="forceMosaic.set($any($event.target).checked)" [disabled]="busy()" />
+        <span>Anti-mosaïque</span>
+      </label>
       <button class="btn ghost" (click)="downloadApk()">↓ APK</button>
       <button class="btn ghost" (click)="resetCache()" title="Vider le cache des modèles">Cache</button>
     </div>

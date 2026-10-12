@@ -92,7 +92,8 @@ export class InferenceService implements OnDestroy {
     w: number,
     h: number,
     targetW: number,
-    targetH: number
+    targetH: number,
+    forceMosaic = false
   ): Promise<InferenceResult> {
     // 1) Poids requis (main + deps) — fetch par chunks + cache IndexedDB.
     const modelId: ModelId = mode === 'sr' ? 'super-resolution' : mode === 'face' ? 'face-restore' : 'demosaic';
@@ -121,6 +122,7 @@ export class InferenceService implements OnDestroy {
       h,
       targetW,
       targetH,
+      forceMosaic,
       modelBytes: bytes,
     };
 
